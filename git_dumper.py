@@ -457,6 +457,23 @@ def parse_size(size_str):
     return int(value * units[unit])
 
 
+def extract_domain_folder(url):
+    """ Extract a safe folder name from URL based on domain / hostname """
+    # Ensure scheme for proper urlparse netloc resolution
+    test_url = url
+    if not (test_url.startswith("http://") or test_url.startswith("https://") or test_url.startswith("file://")):
+        test_url = "http://" + test_url
+
+    parsed = urllib.parse.urlparse(test_url)
+    netloc = parsed.netloc
+    if not netloc:
+        netloc = parsed.path.split("/")[0]
+
+    # Remove port and sanitize characters not suitable for folder names
+    domain = re.sub(r"[:/\\]+", "_", netloc)
+    return domain.strip("._") or "target"
+
+
 def format_size(size_bytes):
     """ Return human-readable size string with exact bytes """
     if size_bytes is None:
@@ -896,7 +913,7 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
                         format_size(disk_size),
                         format_size(max_size),
                     )
-                    return 0
+                    return 2
 
         printf("[-] Fetching .git recursively\n")
         process_tasks(
@@ -1134,7 +1151,7 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
                 format_size(disk_size),
                 format_size(max_size),
             )
-            return 0
+            return 2
 
     # Fetch pack files (.pack) now that size estimation is complete
     if pack_shas:
@@ -1206,13 +1223,18 @@ def main():
         usage="git-dumper [options] URL DIR",
         description="Dump a git repository from a website.",
     )
-    parser.add_argument("url", metavar="URL", help="url or local repository path")
+    parser.add_argument("url", metavar="URL", nargs="?", default=None, help="url or local repository path (not required if using -l/--url-list)")
     parser.add_argument(
         "directory",
         metavar="DIR",
         nargs="?",
         default=None,
         help="output directory (required unless using --estimate-only with a local repository)",
+    )
+    parser.add_argument(
+        "-l",
+        "--url-list",
+        help="file containing a list of URLs to process (one per line)",
     )
     parser.add_argument(
         "--estimate-only",
@@ -1338,38 +1360,18 @@ def main():
         if not proxy_valid:
             parser.error("invalid proxy, got `%s`" % args.proxy)
 
-    # Check if URL is a local repository
-    local_path = None
-    if args.url.startswith("file://"):
-        local_path = args.url[7:]
-    elif os.path.exists(args.url):
-        local_path = args.url
-
-    is_local_repo = False
-    local_git_dir = None
-    if local_path:
-        if os.path.isdir(os.path.join(local_path, ".git")):
-            is_local_repo = True
-            local_git_dir = os.path.join(local_path, ".git")
-        elif os.path.exists(os.path.join(local_path, "HEAD")):
-            is_local_repo = True
-            local_git_dir = local_path
-
-    if is_local_repo:
-        printf("[-] Detected local git repository: %s\n", local_git_dir)
-        stats = analyze_repository_metadata(local_git_dir)
-        print_metadata_analysis_report(stats)
-        if args.max_size is not None:
-            disk_size = stats["index"]["total_uncompressed_size"] if stats.get("index") else stats["total_estimated_download"]
-            if disk_size > args.max_size:
-                printf(
-                    "[-] Skipping: estimated size on disk (%s) exceeds --max-size threshold (%s)\n",
-                    format_size(disk_size),
-                    format_size(args.max_size),
-                )
-                sys.exit(0)
-        if args.estimate_only or not args.directory:
-            sys.exit(0)
+    # Validate inputs based on whether -l/--url-list is used
+    if args.url_list:
+        if not os.path.isfile(args.url_list):
+            parser.error("url list file '%s' does not exist" % args.url_list)
+        if args.directory is None and args.url is not None:
+            args.directory = args.url
+            args.url = None
+        if not args.directory:
+            parser.error("DIR is required when using -l/--url-list")
+    else:
+        if not args.url:
+            parser.error("URL is required unless using -l/--url-list")
 
     # Output directory handling
     temp_dir_obj = None
@@ -1402,6 +1404,104 @@ def main():
             parser.error("client certificate password is required")
 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # Batch URL list execution
+    if args.url_list:
+        with open(args.url_list, "r") as f:
+            raw_lines = [line.strip() for line in f]
+        urls = [u for u in raw_lines if u and not u.startswith("#")]
+        if not urls:
+            printf("[-] No valid URLs found in '%s'\n", args.url_list)
+            sys.exit(0)
+
+        printf("[-] Loaded %d URL(s) from '%s'\n", len(urls), args.url_list)
+        printf("[-] Output base directory: %s\n", args.directory)
+        succeeded = 0
+        skipped = 0
+        failed = 0
+
+        for idx, target_url in enumerate(urls, 1):
+            domain = extract_domain_folder(target_url)
+            target_dir = os.path.join(args.directory, domain)
+
+            printf("\n" + "=" * 80 + "\n")
+            printf("[%d/%d] Target URL: %s\n", idx, len(urls), target_url)
+            printf("      Destination: %s\n", target_dir)
+            printf("=" * 80 + "\n\n")
+
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+
+            try:
+                ret = fetch_git(
+                    target_url,
+                    target_dir,
+                    args.jobs,
+                    args.retry,
+                    args.timeout,
+                    http_headers,
+                    args.branches,
+                    args.client_cert_p12,
+                    args.client_cert_p12_password,
+                    args.method,
+                    args.any_status,
+                    args.estimate_only,
+                    args.estimate,
+                    args.max_size,
+                )
+                if ret == 0:
+                    succeeded += 1
+                elif ret == 2:
+                    skipped += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                printf("\n[-] Error processing %s: %s\n", target_url, e, file=sys.stderr)
+                failed += 1
+
+        printf("\n" + "=" * 80 + "\n")
+        printf("                             BATCH SUMMARY\n")
+        printf("=" * 80 + "\n")
+        printf("    Total Targets:     %d\n", len(urls))
+        printf("    Succeeded:         %d\n", succeeded)
+        printf("    Skipped (--max):   %d\n", skipped)
+        printf("    Failed / Inactive: %d\n", failed)
+        printf("=" * 80 + "\n\n")
+
+        sys.exit(0 if failed == 0 else 1)
+
+    # Single URL / local repository execution
+    local_path = None
+    if args.url.startswith("file://"):
+        local_path = args.url[7:]
+    elif os.path.exists(args.url):
+        local_path = args.url
+
+    is_local_repo = False
+    local_git_dir = None
+    if local_path:
+        if os.path.isdir(os.path.join(local_path, ".git")):
+            is_local_repo = True
+            local_git_dir = os.path.join(local_path, ".git")
+        elif os.path.exists(os.path.join(local_path, "HEAD")):
+            is_local_repo = True
+            local_git_dir = local_path
+
+    if is_local_repo:
+        printf("[-] Detected local git repository: %s\n", local_git_dir)
+        stats = analyze_repository_metadata(local_git_dir)
+        print_metadata_analysis_report(stats)
+        if args.max_size is not None:
+            disk_size = stats["index"]["total_uncompressed_size"] if stats.get("index") else stats["total_estimated_download"]
+            if disk_size > args.max_size:
+                printf(
+                    "[-] Skipping: estimated size on disk (%s) exceeds --max-size threshold (%s)\n",
+                    format_size(disk_size),
+                    format_size(args.max_size),
+                )
+                sys.exit(0)
+        if args.estimate_only or not args.directory:
+            sys.exit(0)
 
     # fetch everything
     try:

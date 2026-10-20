@@ -28,11 +28,13 @@ usage: git-dumper [options] URL DIR
 Dump a git repository from a website.
 
 positional arguments:
-  URL                   url or local repository path
+  URL                   url or local repository path (not required if using -l/--url-list)
   DIR                   output directory (required unless using --estimate-only with a local repository)
 
 optional arguments:
   -h, --help            show this help message and exit
+  -l URL_LIST, --url-list URL_LIST
+                        file containing a list of URLs to process (one per line)
   --estimate-only       perform comprehensive metadata-based size analysis (.git/index and pack .idx files) and exit without downloading full repo
   --estimate            display comprehensive size estimate before proceeding with download
   --max-size MAX_SIZE   skip download if estimated working tree size on disk exceeds limit (e.g. 500MB, 1.5GB, 100M)
@@ -122,6 +124,35 @@ git-dumper --max-size 1.5GB http://website.com/.git ~/website
 git-dumper --max-size 100M --estimate http://website.com/.git ~/website
 ```
 Supported units include `B`, `KB`, `MB`, `GB`, `TB` (e.g. `500M`, `500MB`, `1.5G`, `1.5GB`, `50000000`).
+
+#### Batch URL List Processing (`-l`, `--url-list`)
+
+You can provide a text file containing multiple repository URLs (one per line). `git-dumper` will process each target sequentially and dump its contents into a subfolder named after the respective domain or host inside your specified output directory:
+
+```bash
+# urls.txt:
+# http://example.com/.git
+# http://sub.domain.org/.git
+# https://internal.dev:8080/.git
+
+git-dumper -l urls.txt ~/dumped_repos/
+```
+The directory tree created will be:
+```
+~/dumped_repos/
+├── example.com/
+├── sub.domain.org/
+└── internal.dev_8080/
+```
+
+You can combine batch mode with other flags such as `--max-size`, `--estimate-only`, `--jobs`, and `--timeout`:
+```bash
+# Batch size estimation across a list
+git-dumper -l urls.txt ~/dumped_repos/ --estimate-only
+
+# Batch dumping while skipping any target over 500MB
+git-dumper -l urls.txt ~/dumped_repos/ --max-size 500MB
+```
 
 
 ### Disclaimer
