@@ -418,6 +418,45 @@ def sanitize_file(filepath):
             f.write(modified_content)
 
 
+def parse_size(size_str):
+    """ Parse human-readable size string (e.g. 500M, 1.5GB, 100KB, 1048576) into bytes """
+    if size_str is None:
+        return None
+    size_str = str(size_str).strip()
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)$", size_str)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "Invalid size format: '%s'. Expected format like 500MB, 1.5GB, 100M, 50KB, or raw bytes."
+            % size_str
+        )
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+
+    units = {
+        "": 1,
+        "B": 1,
+        "K": 1024,
+        "KB": 1024,
+        "KIB": 1024,
+        "M": 1024 * 1024,
+        "MB": 1024 * 1024,
+        "MIB": 1024 * 1024,
+        "G": 1024 * 1024 * 1024,
+        "GB": 1024 * 1024 * 1024,
+        "GIB": 1024 * 1024 * 1024,
+        "T": 1024 * 1024 * 1024 * 1024,
+        "TB": 1024 * 1024 * 1024 * 1024,
+        "TIB": 1024 * 1024 * 1024 * 1024,
+    }
+
+    if unit not in units:
+        raise argparse.ArgumentTypeError(
+            "Unknown size unit '%s'. Supported units: B, KB, MB, GB, TB." % unit
+        )
+
+    return int(value * units[unit])
+
+
 def format_size(size_bytes):
     """ Return human-readable size string with exact bytes """
     if size_bytes is None:
@@ -738,7 +777,7 @@ def print_metadata_analysis_report(stats):
     printf("=" * 80 + "\n\n")
 
 
-def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None, client_cert_p12=None, client_cert_p12_password=None, method="GET", any_status=False, estimate_only=False, estimate=False):
+def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None, client_cert_p12=None, client_cert_p12_password=None, method="GET", any_status=False, estimate_only=False, estimate=False, max_size=None):
     """ Dump a git repository into the output directory """
 
     assert os.path.isdir(directory), "%s is not a directory" % directory
@@ -810,7 +849,7 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
         and is_html(response)
         and "HEAD" in get_indexed_files(response)
     ):
-        if estimate_only or estimate:
+        if estimate_only or estimate or max_size is not None:
             printf("[-] Downloading metadata (.git/index, pack .idx) for size estimation\n")
             meta_tasks = [".gitignore"]
             indexed = get_indexed_files(response)
@@ -848,6 +887,16 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
             if estimate_only:
                 printf("[-] Estimate complete (--estimate-only was specified). Exiting without downloading repository payload.\n")
                 return 0
+
+            if max_size is not None:
+                disk_size = stats["index"]["total_uncompressed_size"] if stats.get("index") else stats["total_estimated_download"]
+                if disk_size > max_size:
+                    printf(
+                        "[-] Skipping download: estimated size on disk (%s) exceeds --max-size threshold (%s)\n",
+                        format_size(disk_size),
+                        format_size(max_size),
+                    )
+                    return 0
 
         printf("[-] Fetching .git recursively\n")
         process_tasks(
@@ -1077,6 +1126,16 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
         printf("[-] Estimate complete (--estimate-only was specified). Exiting without downloading repository payload.\n")
         return 0
 
+    if max_size is not None:
+        disk_size = stats["index"]["total_uncompressed_size"] if stats.get("index") else stats["total_estimated_download"]
+        if disk_size > max_size:
+            printf(
+                "[-] Skipping download: estimated size on disk (%s) exceeds --max-size threshold (%s)\n",
+                format_size(disk_size),
+                format_size(max_size),
+            )
+            return 0
+
     # Fetch pack files (.pack) now that size estimation is complete
     if pack_shas:
         printf("[-] Fetching pack files (.pack)\n")
@@ -1164,6 +1223,12 @@ def main():
         "--estimate",
         action="store_true",
         help="display comprehensive size estimate before proceeding with download",
+    )
+    parser.add_argument(
+        "--max-size",
+        type=parse_size,
+        default=None,
+        help="skip downloading if estimated working tree size on disk exceeds limit (e.g. 500MB, 1.5GB, 100M)",
     )
     parser.add_argument("--proxy", help="use the specified proxy")
     parser.add_argument(
@@ -1294,6 +1359,15 @@ def main():
         printf("[-] Detected local git repository: %s\n", local_git_dir)
         stats = analyze_repository_metadata(local_git_dir)
         print_metadata_analysis_report(stats)
+        if args.max_size is not None:
+            disk_size = stats["index"]["total_uncompressed_size"] if stats.get("index") else stats["total_estimated_download"]
+            if disk_size > args.max_size:
+                printf(
+                    "[-] Skipping: estimated size on disk (%s) exceeds --max-size threshold (%s)\n",
+                    format_size(disk_size),
+                    format_size(args.max_size),
+                )
+                sys.exit(0)
         if args.estimate_only or not args.directory:
             sys.exit(0)
 
@@ -1345,6 +1419,7 @@ def main():
             args.any_status,
             args.estimate_only,
             args.estimate,
+            args.max_size,
         )
     finally:
         if temp_dir_obj is not None:

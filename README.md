@@ -35,6 +35,7 @@ optional arguments:
   -h, --help            show this help message and exit
   --estimate-only       perform comprehensive metadata-based size analysis (.git/index and pack .idx files) and exit without downloading full repo
   --estimate            display comprehensive size estimate before proceeding with download
+  --max-size MAX_SIZE   skip download if estimated working tree size on disk exceeds limit (e.g. 500MB, 1.5GB, 100M)
   --proxy PROXY         use the specified proxy
   -X METHOD, --method METHOD
                         HTTP method to use for all requests (e.g. GET, POST)
@@ -105,6 +106,22 @@ To display the size breakdown before proceeding with a normal download:
 ```
 git-dumper --estimate http://website.com/.git ~/website
 ```
+
+#### Skip Hosts Exceeding Size Threshold (`--max-size`)
+
+When scanning multiple targets or trying to prevent filling up disk space with huge repositories, use `--max-size` to automatically skip targets whose estimated working tree size on disk exceeds a defined limit. The check runs against the `.git/index` metadata before downloading `.pack` files or loose objects:
+
+```
+# Skip if the repository on disk exceeds 500 megabytes
+git-dumper --max-size 500MB http://website.com/.git ~/website
+
+# Skip if above 1.5 gigabytes
+git-dumper --max-size 1.5GB http://website.com/.git ~/website
+
+# Combine with --estimate to see the size check in action
+git-dumper --max-size 100M --estimate http://website.com/.git ~/website
+```
+Supported units include `B`, `KB`, `MB`, `GB`, `TB` (e.g. `500M`, `500MB`, `1.5G`, `1.5GB`, `50000000`).
 
 
 ### Disclaimer
