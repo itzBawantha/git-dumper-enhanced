@@ -28,11 +28,13 @@ usage: git-dumper [options] URL DIR
 Dump a git repository from a website.
 
 positional arguments:
-  URL                   url
-  DIR                   output directory
+  URL                   url or local repository path
+  DIR                   output directory (required unless using --estimate-only with a local repository)
 
 optional arguments:
   -h, --help            show this help message and exit
+  --estimate-only       perform comprehensive metadata-based size analysis (.git/index and pack .idx files) and exit without downloading full repo
+  --estimate            display comprehensive size estimate before proceeding with download
   --proxy PROXY         use the specified proxy
   -X METHOD, --method METHOD
                         HTTP method to use for all requests (e.g. GET, POST)
@@ -84,6 +86,24 @@ body is non-empty and not HTML:
 
 ```
 git-dumper --any-status http://website.com/.git ~/website
+```
+
+#### Size Estimation & Metadata Analysis
+
+Before downloading full repository objects and large packfiles, git-dumper can inspect the repository metadata (`.git/index`, pack `.idx` files, and refs) to calculate a comprehensive size breakdown (working tree size, pack files size, loose objects needed, and total network transfer size).
+
+To only inspect the size breakdown without downloading full payloads or checking out files:
+```
+# Against a remote website
+git-dumper --estimate-only http://website.com/.git
+
+# Against a local repository directory
+git-dumper --estimate-only /path/to/repo
+```
+
+To display the size breakdown before proceeding with a normal download:
+```
+git-dumper --estimate http://website.com/.git ~/website
 ```
 
 

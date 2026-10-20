@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from contextlib import closing
 import argparse
+import binascii
+import glob
 import multiprocessing
 import os
 import os.path
@@ -8,12 +10,14 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import traceback
 import urllib.parse
 import urllib3
 import bs4
 import dulwich.index
 import dulwich.objects
+import dulwich.object_format
 import dulwich.pack
 import requests
 import socks
@@ -414,7 +418,327 @@ def sanitize_file(filepath):
             f.write(modified_content)
 
 
-def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None, client_cert_p12=None, client_cert_p12_password=None, method="GET", any_status=False):
+def format_size(size_bytes):
+    """ Return human-readable size string with exact bytes """
+    if size_bytes is None:
+        return "Unknown"
+    size = float(size_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(size) < 1024.0 or unit == 'TB':
+            if unit == 'B':
+                return "%d B" % int(size)
+            return "%.2f %s (%s bytes)" % (size, unit, f"{int(size_bytes):,}")
+        size /= 1024.0
+    return "%s bytes" % f"{int(size_bytes):,}"
+
+
+def get_remote_file_size(session, url, filepath, method="HEAD", timeout=3):
+    """ Query remote file size via HTTP HEAD or stream GET without downloading the full body """
+    try:
+        resp = session.request(
+            "HEAD",
+            "%s/%s" % (url, filepath),
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        if resp.status_code == 200 and "Content-Length" in resp.headers:
+            return int(resp.headers["Content-Length"])
+    except Exception:
+        pass
+
+    try:
+        with closing(
+            session.request(
+                "GET",
+                "%s/%s" % (url, filepath),
+                stream=True,
+                allow_redirects=True,
+                timeout=timeout,
+            )
+        ) as resp:
+            if resp.status_code == 200 and "Content-Length" in resp.headers:
+                return int(resp.headers["Content-Length"])
+    except Exception:
+        pass
+
+    return None
+
+
+def analyze_index_metadata(index_path):
+    """ Parse .git/index and extract tracked files, uncompressed sizes, and blob shas """
+    if not os.path.isfile(index_path):
+        return None
+
+    try:
+        index = dulwich.index.Index(index_path)
+    except Exception as e:
+        printf("[-] Unable to parse .git/index: %s\n", e, file=sys.stderr)
+        return None
+
+    total_uncompressed_size = 0
+    unique_blobs = set()
+    blob_sizes = {}
+    files_list = []
+    ext_stats = {}
+
+    for path_bytes, entry in index.iteritems():
+        path_str = path_bytes.decode(errors="replace")
+        total_uncompressed_size += entry.size
+        sha_hex = binascii.hexlify(entry.sha).decode() if isinstance(entry.sha, bytes) else str(entry.sha)
+        unique_blobs.add(sha_hex)
+        blob_sizes[sha_hex] = entry.size
+        files_list.append((path_str, entry.size))
+
+        ext = os.path.splitext(path_str)[1].lower() or "[no extension]"
+        if ext not in ext_stats:
+            ext_stats[ext] = {"count": 0, "size": 0}
+        ext_stats[ext]["count"] += 1
+        ext_stats[ext]["size"] += entry.size
+
+    files_list.sort(key=lambda x: x[1], reverse=True)
+    sorted_exts = sorted(ext_stats.items(), key=lambda x: x[1]["size"], reverse=True)
+
+    return {
+        "file_count": len(index),
+        "total_uncompressed_size": total_uncompressed_size,
+        "unique_blobs": unique_blobs,
+        "blob_sizes": blob_sizes,
+        "top_files": files_list[:5],
+        "extensions": sorted_exts[:5],
+    }
+
+
+def analyze_packs_metadata(pack_dir, session=None, base_url=None, timeout=3):
+    """ Analyze pack .idx files and estimate or query .pack file sizes """
+    packs_data = []
+    total_packed_objs = set()
+    total_pack_download_size = 0
+    total_idx_size = 0
+
+    if not os.path.isdir(pack_dir):
+        return {
+            "packs": [],
+            "total_packed_objects": set(),
+            "total_pack_download_size": 0,
+            "total_idx_size": 0,
+        }
+
+    for filename in sorted(os.listdir(pack_dir)):
+        if not (filename.startswith("pack-") and filename.endswith(".idx")):
+            continue
+
+        idx_path = os.path.join(pack_dir, filename)
+        pack_filename = filename[:-4] + ".pack"
+        pack_path = os.path.join(pack_dir, pack_filename)
+
+        idx_size = os.path.getsize(idx_path)
+        total_idx_size += idx_size
+
+        try:
+            pack_idx = dulwich.pack.load_pack_index(
+                idx_path,
+                object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT,
+            )
+            entries = list(pack_idx.iterentries())
+            offsets = sorted(offset for sha, offset, crc in entries)
+            pack_shas = {
+                binascii.hexlify(sha).decode() if isinstance(sha, bytes) else str(sha)
+                for sha, offset, crc in entries
+            }
+            total_packed_objs.update(pack_shas)
+        except Exception as e:
+            printf("[-] Skipping unparseable pack index %s: %s\n", filename, e, file=sys.stderr)
+            continue
+
+        pack_size = None
+        exact_source = None
+
+        # Check local file if exists
+        if os.path.isfile(pack_path):
+            pack_size = os.path.getsize(pack_path)
+            exact_source = "local"
+        # Query remote server if session and base_url are provided
+        elif session and base_url:
+            remote_size = get_remote_file_size(
+                session, base_url, ".git/objects/pack/" + pack_filename, timeout=timeout
+            )
+            if remote_size is not None:
+                pack_size = remote_size
+                exact_source = "http"
+
+        # Fallback to estimate from .idx offsets
+        if pack_size is None:
+            # max(offsets) points to the start of the last object.
+            # Add ~250 bytes (avg last object) + 20 bytes SHA trailer.
+            pack_size = (max(offsets) + 270) if offsets else 32
+            exact_source = "estimated"
+
+        total_pack_download_size += pack_size
+
+        packs_data.append({
+            "idx_file": filename,
+            "pack_file": pack_filename,
+            "object_count": len(entries),
+            "idx_size": idx_size,
+            "pack_size": pack_size,
+            "exact_source": exact_source,
+            "min_offset": min(offsets) if offsets else 0,
+            "max_offset": max(offsets) if offsets else 0,
+        })
+
+    return {
+        "packs": packs_data,
+        "total_packed_objects": total_packed_objs,
+        "total_pack_download_size": total_pack_download_size,
+        "total_idx_size": total_idx_size,
+    }
+
+
+def analyze_repository_metadata(git_dir, session=None, base_url=None, timeout=3, candidate_objs=None):
+    """ Perform comprehensive metadata-based size analysis on .git/index and pack .idx files """
+    index_path = os.path.join(git_dir, "index")
+    pack_dir = os.path.join(git_dir, "objects", "pack")
+
+    index_stats = analyze_index_metadata(index_path)
+    packs_stats = analyze_packs_metadata(pack_dir, session=session, base_url=base_url, timeout=timeout)
+
+    # Discovered candidate objects if not passed
+    if candidate_objs is None:
+        candidate_objs = set()
+        ref_files = [
+            os.path.join(git_dir, "packed-refs"),
+            os.path.join(git_dir, "info", "refs"),
+            os.path.join(git_dir, "FETCH_HEAD"),
+            os.path.join(git_dir, "ORIG_HEAD"),
+        ]
+        for dirpath, _, filenames in os.walk(os.path.join(git_dir, "refs")):
+            for filename in filenames:
+                ref_files.append(os.path.join(dirpath, filename))
+        for dirpath, _, filenames in os.walk(os.path.join(git_dir, "logs")):
+            for filename in filenames:
+                ref_files.append(os.path.join(dirpath, filename))
+
+        for filepath in ref_files:
+            if not os.path.exists(filepath):
+                continue
+            try:
+                with open(filepath, "r", errors="ignore") as f:
+                    content = f.read()
+                for obj in re.findall(r"(^|\s)([a-f0-9]{40})($|\s)", content):
+                    candidate_objs.add(obj[1])
+            except Exception:
+                pass
+
+        if index_stats:
+            candidate_objs.update(index_stats["unique_blobs"])
+
+    packed_objs = packs_stats["total_packed_objects"]
+    loose_objs = candidate_objs - packed_objs
+
+    # Estimate loose objects download size
+    blob_sizes = index_stats["blob_sizes"] if index_stats else {}
+    estimated_loose_size = 0
+    for sha in loose_objs:
+        if sha in blob_sizes:
+            # Git deflates blobs. Average code/text compresses to ~40-50%
+            estimated_loose_size += int(blob_sizes[sha] * 0.45) + 32
+        else:
+            # Commit / tree / tag average compressed size
+            estimated_loose_size += 600
+
+    # Calculate metadata files size currently on disk
+    metadata_download_size = 0
+    for root, _, filenames in os.walk(git_dir):
+        for fname in filenames:
+            # exclude .pack files from metadata count
+            if not fname.endswith(".pack"):
+                fpath = os.path.join(root, fname)
+                try:
+                    metadata_download_size += os.path.getsize(fpath)
+                except OSError:
+                    pass
+
+    total_pack_size = packs_stats["total_pack_download_size"]
+    total_estimated_download = metadata_download_size + total_pack_size + estimated_loose_size
+
+    return {
+        "index": index_stats,
+        "packs": packs_stats,
+        "loose": {
+            "candidate_count": len(candidate_objs),
+            "packed_count": len(packed_objs),
+            "loose_count": len(loose_objs),
+            "estimated_size": estimated_loose_size,
+        },
+        "metadata_download_size": metadata_download_size,
+        "total_pack_size": total_pack_size,
+        "total_loose_size": estimated_loose_size,
+        "total_estimated_download": total_estimated_download,
+    }
+
+
+def print_metadata_analysis_report(stats):
+    """ Display a structured, detailed size estimation report """
+    printf("\n" + "=" * 80 + "\n")
+    printf("                  METADATA-BASED REPOSITORY SIZE ESTIMATE\n")
+    printf("=" * 80 + "\n\n")
+
+    idx = stats.get("index")
+    if idx:
+        printf("[+] Working Tree (.git/index):\n")
+        printf("    Tracked files:       %d\n", idx["file_count"])
+        printf("    Uncompressed size:   %s\n", format_size(idx["total_uncompressed_size"]))
+        printf("    Unique staged blobs: %d\n", len(idx["unique_blobs"]))
+        if idx["extensions"]:
+            printf("    Top file types:\n")
+            for ext, ext_data in idx["extensions"]:
+                printf("      %-18s %4d files,  %s\n", ext + ":", ext_data["count"], format_size(ext_data["size"]))
+        if idx["top_files"]:
+            printf("    Largest files in index:\n")
+            for path_str, fsize in idx["top_files"]:
+                printf("      - %-35s %s\n", path_str[:35], format_size(fsize))
+        printf("\n")
+    else:
+        printf("[-] Working Tree (.git/index): Not available or empty\n\n")
+
+    packs = stats.get("packs")
+    if packs and packs["packs"]:
+        printf("[+] Packfile Analysis (.git/objects/pack/*.idx):\n")
+        printf("    Pack files found:    %d\n", len(packs["packs"]))
+        for p in packs["packs"]:
+            tag = "Exact via Content-Length" if p["exact_source"] == "http" else (
+                "Local file" if p["exact_source"] == "local" else "Estimated from .idx offsets"
+            )
+            printf("    * %s:\n", p["pack_file"])
+            printf("        Objects inside pack: %d\n", p["object_count"])
+            printf("        .idx file size:      %s\n", format_size(p["idx_size"]))
+            printf("        .pack download size: %s (%s)\n", format_size(p["pack_size"]), tag)
+        printf("    Total pack transfer: %s\n\n", format_size(packs["total_pack_download_size"]))
+    else:
+        printf("[-] Packfile Analysis: No pack files found\n\n")
+
+    loose = stats.get("loose")
+    if loose:
+        printf("[+] Loose Objects Analysis:\n")
+        printf("    Total candidate objs: %d\n", loose["candidate_count"])
+        printf("    Already in packfiles: %d\n", loose["packed_count"])
+        printf("    Loose objects needed: %d\n", loose["loose_count"])
+        printf("    Estimated loose size: %s\n\n", format_size(loose["estimated_size"]))
+
+    printf("=" * 80 + "\n")
+    printf("                         DOWNLOAD & DISK SUMMARY\n")
+    printf("=" * 80 + "\n")
+    printf("    Metadata files (.git/index, refs, .idx): %s\n", format_size(stats["metadata_download_size"]))
+    printf("    Pack files (.pack):                      %s\n", format_size(stats["total_pack_size"]))
+    printf("    Loose objects (.git/objects/xx/*):       %s\n", format_size(stats["total_loose_size"]))
+    printf("    ----------------------------------------------------------------------------\n")
+    printf("    ESTIMATED NETWORK DOWNLOAD:              %s\n", format_size(stats["total_estimated_download"]))
+    if idx:
+        printf("    ESTIMATED WORKING TREE (ON DISK):        %s\n", format_size(idx["total_uncompressed_size"]))
+    printf("=" * 80 + "\n\n")
+
+
+def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None, client_cert_p12=None, client_cert_p12_password=None, method="GET", any_status=False, estimate_only=False, estimate=False):
     """ Dump a git repository into the output directory """
 
     assert os.path.isdir(directory), "%s is not a directory" % directory
@@ -486,6 +810,45 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
         and is_html(response)
         and "HEAD" in get_indexed_files(response)
     ):
+        if estimate_only or estimate:
+            printf("[-] Downloading metadata (.git/index, pack .idx) for size estimation\n")
+            meta_tasks = [".gitignore"]
+            indexed = get_indexed_files(response)
+            if any("index" in f for f in indexed):
+                meta_tasks.append(".git/index")
+            if any("info/packs" in f for f in indexed):
+                meta_tasks.append(".git/objects/info/packs")
+            process_tasks(
+                meta_tasks,
+                DownloadWorker,
+                jobs,
+                args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password, method, any_status),
+            )
+            # If info/packs exists, also download any .idx files
+            info_packs_p = os.path.join(directory, ".git", "objects", "info", "packs")
+            if os.path.exists(info_packs_p):
+                with open(info_packs_p, "r") as f:
+                    pack_shas = re.findall(r"pack-([a-f0-9]{40})\.pack", f.read())
+                idx_tasks = [".git/objects/pack/pack-%s.idx" % s for s in pack_shas]
+                process_tasks(
+                    idx_tasks,
+                    DownloadWorker,
+                    jobs,
+                    args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password, method, any_status),
+                )
+
+            stats = analyze_repository_metadata(
+                os.path.join(directory, ".git"),
+                session=session,
+                base_url=url,
+                timeout=timeout,
+            )
+            print_metadata_analysis_report(stats)
+
+            if estimate_only:
+                printf("[-] Estimate complete (--estimate-only was specified). Exiting without downloading repository payload.\n")
+                return 0
+
         printf("[-] Fetching .git recursively\n")
         process_tasks(
             [".git/", ".gitignore"],
@@ -604,7 +967,7 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
 
     # find packs
     printf("[-] Finding packs\n")
-    tasks = []
+    pack_shas = []
 
     # use .git/objects/info/packs to find packs
     info_packs_path = os.path.join(
@@ -614,16 +977,18 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
         with open(info_packs_path, "r") as f:
             info_packs = f.read()
 
-        for sha1 in re.findall(r"pack-([a-f0-9]{40})\.pack", info_packs):
-            tasks.append(".git/objects/pack/pack-%s.idx" % sha1)
-            tasks.append(".git/objects/pack/pack-%s.pack" % sha1)
+        pack_shas = re.findall(r"pack-([a-f0-9]{40})\.pack", info_packs)
 
-    process_tasks(
-        tasks,
-        DownloadWorker,
-        jobs,
-        args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password, method, any_status),
-    )
+    # Fetch pack index files (.idx) first to inspect metadata without downloading huge .pack files
+    if pack_shas:
+        printf("[-] Fetching pack index files (.idx)\n")
+        idx_tasks = [".git/objects/pack/pack-%s.idx" % sha1 for sha1 in pack_shas]
+        process_tasks(
+            idx_tasks,
+            DownloadWorker,
+            jobs,
+            args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password, method, any_status),
+        )
 
     # find objects
     printf("[-] Finding objects\n")
@@ -652,7 +1017,7 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
         if not os.path.exists(filepath):
             continue
 
-        with open(filepath, "r") as f:
+        with open(filepath, "r", errors="ignore") as f:
             content = f.read()
 
         for obj in re.findall(r"(^|\s)([a-f0-9]{40})($|\s)", content):
@@ -676,32 +1041,81 @@ def fetch_git(url, directory, jobs, retry, timeout, http_headers, branches=None,
                 file=sys.stderr,
             )
 
-    # use packs to find more objects to fetch, and objects that are packed
+    # use pack .idx files to find packed objects
     pack_file_dir = os.path.join(directory, ".git", "objects", "pack")
     if os.path.isdir(pack_file_dir):
+        for filename in os.listdir(pack_file_dir):
+            if filename.startswith("pack-") and filename.endswith(".idx"):
+                pack_idx_path = os.path.join(pack_file_dir, filename)
+                try:
+                    pack_idx = dulwich.pack.load_pack_index(
+                        pack_idx_path,
+                        object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT,
+                    )
+                    for entry in pack_idx.iterentries():
+                        sha = binascii.hexlify(entry[0]).decode() if isinstance(entry[0], bytes) else str(entry[0])
+                        packed_objs.add(sha)
+                except Exception as e:
+                    printf(
+                        "[-] Skipping unparseable pack index %s: %s\n",
+                        filename,
+                        e,
+                        file=sys.stderr,
+                    )
+
+    # Run metadata-based size analysis before downloading .pack files and loose objects
+    stats = analyze_repository_metadata(
+        os.path.join(directory, ".git"),
+        session=session,
+        base_url=url,
+        timeout=timeout,
+        candidate_objs=objs,
+    )
+    print_metadata_analysis_report(stats)
+
+    if estimate_only:
+        printf("[-] Estimate complete (--estimate-only was specified). Exiting without downloading repository payload.\n")
+        return 0
+
+    # Fetch pack files (.pack) now that size estimation is complete
+    if pack_shas:
+        printf("[-] Fetching pack files (.pack)\n")
+        pack_tasks = [".git/objects/pack/pack-%s.pack" % sha1 for sha1 in pack_shas]
+        process_tasks(
+            pack_tasks,
+            DownloadWorker,
+            jobs,
+            args=(url, directory, retry, timeout, http_headers, client_cert_p12, client_cert_p12_password, method, any_status),
+        )
+
+        # parse downloaded packs to find more referenced objects
         for filename in os.listdir(pack_file_dir):
             if filename.startswith("pack-") and filename.endswith(".pack"):
                 pack_data_path = os.path.join(pack_file_dir, filename)
                 pack_idx_path = os.path.join(
                     pack_file_dir, filename[:-5] + ".idx"
                 )
-                # A corrupt pack/idx (e.g. an error page saved via --any-status)
-                # must not abort the dump; skip it and continue.
-                try:
-                    pack_data = dulwich.pack.PackData(pack_data_path, object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT)
-                    pack_idx = dulwich.pack.load_pack_index(pack_idx_path, object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT)
-                    pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
+                if os.path.exists(pack_data_path) and os.path.exists(pack_idx_path):
+                    try:
+                        pack_data = dulwich.pack.PackData(
+                            pack_data_path,
+                            object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT,
+                        )
+                        pack_idx = dulwich.pack.load_pack_index(
+                            pack_idx_path,
+                            object_format=dulwich.object_format.DEFAULT_OBJECT_FORMAT,
+                        )
+                        pack = dulwich.pack.Pack.from_objects(pack_data, pack_idx)
 
-                    for obj_file in pack.iterobjects():
-                        packed_objs.add(obj_file.sha().hexdigest())
-                        objs |= set(get_referenced_sha1(obj_file))
-                except Exception as e:
-                    printf(
-                        "[-] Skipping unparseable pack %s: %s\n",
-                        filename,
-                        e,
-                        file=sys.stderr,
-                    )
+                        for obj_file in pack.iterobjects():
+                            objs |= set(get_referenced_sha1(obj_file))
+                    except Exception as e:
+                        printf(
+                            "[-] Skipping unparseable pack %s: %s\n",
+                            filename,
+                            e,
+                            file=sys.stderr,
+                        )
 
     # fetch all objects
     printf("[-] Fetching objects\n")
@@ -733,8 +1147,24 @@ def main():
         usage="git-dumper [options] URL DIR",
         description="Dump a git repository from a website.",
     )
-    parser.add_argument("url", metavar="URL", help="url")
-    parser.add_argument("directory", metavar="DIR", help="output directory")
+    parser.add_argument("url", metavar="URL", help="url or local repository path")
+    parser.add_argument(
+        "directory",
+        metavar="DIR",
+        nargs="?",
+        default=None,
+        help="output directory (required unless using --estimate-only with a local repository)",
+    )
+    parser.add_argument(
+        "--estimate-only",
+        action="store_true",
+        help="perform comprehensive metadata-based size analysis (.git/index and pack .idx files) and exit without downloading full repo",
+    )
+    parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help="display comprehensive size estimate before proceeding with download",
+    )
     parser.add_argument("--proxy", help="use the specified proxy")
     parser.add_argument(
         "-X",
@@ -843,7 +1273,39 @@ def main():
         if not proxy_valid:
             parser.error("invalid proxy, got `%s`" % args.proxy)
 
-    # output directory
+    # Check if URL is a local repository
+    local_path = None
+    if args.url.startswith("file://"):
+        local_path = args.url[7:]
+    elif os.path.exists(args.url):
+        local_path = args.url
+
+    is_local_repo = False
+    local_git_dir = None
+    if local_path:
+        if os.path.isdir(os.path.join(local_path, ".git")):
+            is_local_repo = True
+            local_git_dir = os.path.join(local_path, ".git")
+        elif os.path.exists(os.path.join(local_path, "HEAD")):
+            is_local_repo = True
+            local_git_dir = local_path
+
+    if is_local_repo:
+        printf("[-] Detected local git repository: %s\n", local_git_dir)
+        stats = analyze_repository_metadata(local_git_dir)
+        print_metadata_analysis_report(stats)
+        if args.estimate_only or not args.directory:
+            sys.exit(0)
+
+    # Output directory handling
+    temp_dir_obj = None
+    if not args.directory:
+        if args.estimate_only:
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix="git_dumper_meta_")
+            args.directory = temp_dir_obj.name
+        else:
+            parser.error("DIR is required when downloading a repository")
+
     if not os.path.exists(args.directory):
         os.makedirs(args.directory)
 
@@ -868,8 +1330,8 @@ def main():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     # fetch everything
-    sys.exit(
-        fetch_git(
+    try:
+        ret = fetch_git(
             args.url,
             args.directory,
             args.jobs,
@@ -881,8 +1343,14 @@ def main():
             args.client_cert_p12_password,
             args.method,
             args.any_status,
+            args.estimate_only,
+            args.estimate,
         )
-    )
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+
+    sys.exit(ret)
 
 
 if __name__ == "__main__":
